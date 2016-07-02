@@ -1,262 +1,283 @@
 var redis = require('redis'),
-	minimist = require('minimist'),
-	_ = require('underscore'),
-	mainLogLevel = 0;
+    Step = require('step'),
+    minimist = require('minimist'),
+    mainLogLevel = 0;
 
 function debug(text, logLevel) {
-	logLevel = logLevel || 4;
-	if (logLevel <= mainLogLevel) {
-		console.log(text);
-	}
+    logLevel = logLevel || 4;
+    if (logLevel <= mainLogLevel) {
+        console.log(text);
+    }
 }
 
-function Writer(params) {
-	params = _.extend({}, params);
-	params.publishInterval = (params.publishInterval === null || params.publishInterval === undefined) ? 500 : params.publishInterval;
+function Worker(params) {
+    this.id = params.id || 0;
+    this.client = null;
+    this.expireInterval = params.expireInterval || 2;
+    this.publishInterval = (params.publishInterval === undefined) ? 500 : params.publishInterval;
+    this.isPublisher = false;
+    this.needToStop = false; //Flag to stop if an error occured
+    this.limitMessages = (params.limitMessages === undefined) ? -1 : (params.limitMessages + 1);
 
-	this.client = redis.createClient();
-	this.expireInterval = params.expireInterval || 2;
-	this.publishInterval = params.publishInterval;
-	this.limitMessages = params.limit || -1;
-	this.unsibscribe = false;
-
-	this.becomeHND = null;
-	this.remainHND = null;
-	this.publishHND = null;
-	this.receivedAmount = 0;
-
-	var self = this;
+    this.stats = {
+        received: 0,
+        published: 0
+    };
 }
 
-Writer.prototype.becomePublisher = function(callback) {
-	var self = this,
-		checkPublishInterval = this.expireInterval  * 1000;
+Worker.prototype.subscribe = function() {
+    var self = this;
 
-    this.becomeHND = setInterval(function() {
-        self.client.set('publisher', 1, 'NX', 'EX', self.expireInterval, function(err, res) {
-            if (err) {
-                clearInterval(self.becomeHND);
-                callback && callback(err);
-            }
+    var eventHandler = function(msg, callback) {
+        function onComplete() {
+            var error = Math.random() > 0.85;
+            callback(error, msg);
+        }
 
-            if (res === 'OK') {
-                clearInterval(self.becomeHND);
-                debug('Became a publisher', 1);
-                callback && callback(null, true);
-            }
-        });
-    }, checkPublishInterval);
+        setTimeout(onComplete, Math.floor(Math.random() * 1000));
+    };
+
+    var errorHandler = function(err, msg) {
+        if (err) {
+            self.client.rpush('errors', msg, function(error, asnw) {
+                if (error) {
+                    self.needToStop = true;
+                    throw new Error(error);
+                }
+            });
+        }
+
+        self.cnt = ++msg;
+        process.nextTick(receiveMes);
+    };
+
+    var receiveMes = function() {
+        if (!self.isPublisher && !self.needToStop) {
+            self.client.lpop('messages', function(err, result) {
+                if (err) {
+                    debug('Caught an error from redis: ' + err.message, 1);
+                    self.needToStop = true;
+                }
+
+                if (!result) {
+                    process.nextTick(receiveMes);
+                } else {
+                    debug('A message has been received: ' + result, 3);
+                    ++self.stats.received; //for statistic
+                    eventHandler(result, errorHandler);
+                }
+            });
+        }
+    };
+
+    receiveMes();
 };
 
-Writer.prototype.remainPublisher = function() {
+Worker.prototype.becomePublisher = function(callback) {
     var self = this,
-    	remainInterval = this.expireInterval * 500;
+        checkPublishInterval = this.expireInterval * 1000;
 
-    this.remainHND = setInterval(function() {
-        self.client.set('publisher', true, 'EX', self.expireInterval, function(err, res) {
-            if (err) {
-                debug('error message: ' + err.message, 1);
-                clearInterval(self.remainHND);
-                throw new Error(err.message);
-            }
+    (function tryToBecomePub() {
+        if (!self.isPublisher && !self.needToStop) {
+            self.client.set('publisher', 1, 'NX', 'EX', self.expireInterval, function(err, res) {
+                if (err) {
+                    self.needToStop = true;
+                    callback && callback(err);
+                }
 
-            if (res === 'OK') {
-                debug('We are still a publisher', 2);
-            }
-        });
-    }, remainInterval);
+                if (res === 'OK') {
+                    self.isPublisher = true;
+                    debug('Became a publisher', 1);
+                    callback && callback(null, true);
+                } else {
+                    setTimeout(tryToBecomePub, checkPublishInterval);
+                }
+            });
+        }
+    })();
 };
 
-Writer.prototype.getMessage = function() {
+Worker.prototype.remainPublisher = function(callback) {
+    var self = this,
+        remainInterval = this.expireInterval * 500;
+
+    (function capturePubFlag() {
+        if (!self.needToStop) {
+            self.client.set('publisher', true, 'EX', self.expireInterval, function(err, res) {
+                if (err) {
+                    debug('error message: ' + err.message, 1);
+                    self.needToStop = true;
+                    throw new Error(err);
+                }
+
+                if (res === 'OK') {
+                    debug('We are still a publisher', 2);
+                    setTimeout(capturePubFlag, remainInterval);
+                } else {
+                    debug('unknown answer: ' + res);
+                    self.needToStop = true;
+                    callback(null, {
+                        stop: true
+                    });
+                }
+            });
+        } else {
+            callback(null, {
+                stop: true
+            });
+        }
+    })();
+};
+
+Worker.prototype.getMessage = function() {
     this.cnt = this.cnt || 0;
     return this.cnt++;
 };
 
-Writer.prototype.subscribe = function() {
-	var self = this;
-
-	var eventHandler = function(msg, callback) {
-		function onComplete() {
-			var error = Math.random() > 0.85;
-			callback(error, msg);
-		}
-
-		setTimeout(onComplete, Math.floor(Math.random() * 1000));
-	};
-
-	var errorHandler = function(err, msg) {
-		if (err) {
-			self.client.rpush('errors', msg, function(error, asnw) {
-				if (error) throw new Error(error);
-			});
-		}
-
-		self.cnt = ++msg;
-		process.nextTick(receiveMes);
-	};
-
-	var receiveMes = function() {
-		if (!self.unsibscribe) {
-			self.client.lpop('messages', function(err, result) {
-				if (err) {
-					debug('Caught an error from redis: ' + err.message, 1);
-					throw new Error(err);
-				}
-
-				if (!result) {
-					process.nextTick(receiveMes);
-				} else {
-					debug('A message has been received: ' + result, 3);
-					++self.receivedAmount;//for statistic
-					eventHandler(result, errorHandler);
-				}
-			});
-		}
-	};
-
-	receiveMes();
-};
-
-Writer.prototype.startPublish = function() {
+Worker.prototype.startPublish = function(callback) {
     var self = this;
-    this.unsibscribe = true;
 
-    this.publishHND = setInterval(function() {
-    	if (--self.limitMessages !== 0) {
-    		self.client.rpush('messages', self.getMessage(), function(err, answ) {
-    			if (err) throw new Error(err);
-    		});
-    	} else {
-    		clearInterval(self.publishHND);
-    		debug('Stop publish messages', 2);
-    	}
-    }, this.publishInterval);
-};
-
-Writer.prototype.printErrors = function(callback) {
-	var bulk = this.client.multi();
-	bulk.lrange('errors', 0, -1);
-	bulk.del('errors');
-
-	bulk.exec(function(err, answ) {
-		if (err) {
-			callback && callback({
-				res : 'err',
-				descr : err.message
-			});
-		}
-		else {
-			console.log(answ[0]);
-			callback && callback({
-				res : 'ok'
-			});
-		}
-	});
-};
-
-Writer.prototype.getReceivedAmmount = function() {
-	return this.receivedAmount;
-};
-
-Writer.prototype.terminate = function() {
-	this.unsibscribe = true;
-	this.becomeHND && clearInterval(this.becomeHND);
-	this.remainHND && clearInterval(this.remainHND);
-	this.publishHND && clearInterval(this.publishHND);
-	this.client.quit();
-};
-
-function Worker(params) {
-	params = _.extend({}, params);
-	this.workerId = params.id;
-    this.writer = new Writer({
-    	limit : params.limit || -1,
-    	expireInterval : 2,
-    	publishInterval : params.publishInterval
-    }); 
-}
-
-Worker.prototype.printErrors = function() {
-	var self = this;
-	this.writer.printErrors(function() {
-		self.writer.terminate();
-	});
-};
-
-Worker.prototype.makePublisherStuff = function(callback) {
-    debug('Start doing publisher\'s work', 3);
-    try {
-    	this.writer.startPublish();
-    	this.writer.remainPublisher();
-    }
-    catch(e) {
-    	callback && callback({
-    		res : 'err',
-    		descr : e.message
-    	});
-    }
-};
-
-Worker.prototype.start = function() {
-	var self = this,
-		showStatHND = null;
-	try {
-		this.writer.subscribe();
-		showStatHND = setInterval(function() {
-			debug('-------------------------------', 1);
-			debug('Worker-' + self.workerId + ' received ' + self.writer.getReceivedAmmount() + ' messages', 1);
-			debug('-------------------------------\n', 1);
-		}, 5000);
-	}
-	catch(e) {
-		debug('Handle an error: ' + e.message, 1);
-		return;
-	}
-
-	this.writer.becomePublisher(function(err, resp) {
-		showStatHND && clearInterval(showStatHND);
-        if (err) {
-            debug('An error has handled: ' + err.message, 1);
-            this.writer.terminate();
-            return;
-        } else {
-            if (resp === true) {
-                self.makePublisherStuff();
+    (function sendMes() {
+        if (!self.needToStop) {
+            if (--self.limitMessages !== 0) {
+                self.client.rpush('messages', self.getMessage(), function(err, answ) {
+                    if (err) {
+                        self.needToStop = true;
+                        throw new Error(err);
+                    } else {
+                        debug('Just publish a message', 3);
+                        ++self.stats.published; //for statistic
+                        setTimeout(sendMes, self.publishInterval);
+                    }
+                });
             } else {
-                debug('unknown paramenter: ' + resp, 1);
-                this.writer.terminate();
-                return;
+                debug('Stop publish messages', 2);
+                self.needToStop = true;
+                callback(null, {
+                    stop: true
+                });
             }
+        } else {
+            callback(null, {
+                stop: true
+            });
         }
+    })();
+};
+
+Worker.prototype.enableClient = function(callback) {
+    this.client = redis.createClient();
+
+    this.client.on('error', function(err) {
+        throw new Error(err);
+    });
+
+    this.client.on('ready', function() {
+        callback(null);
+    });
+};
+
+Worker.prototype.printStats = function() {
+    var self = this;
+
+    var intHND = setInterval(function() {
+        console.log('Worker-' + self.id + ': ' + JSON.stringify(self.stats, null, 4));
+        if (self.needToStop) {
+            clearInterval(intHND);
+        }
+    }, 5000);
+};
+
+Worker.prototype.printErrors = function(callback) {
+    var self = this;
+
+    Step(function() {
+        self.enableClient(this.parallel());
+    }, function(err, res) {
+        if (err) throw err;
+
+        var bulk = self.client.multi();
+        bulk.lrange('errors', 0, -1);
+        bulk.del('errors');
+
+        bulk.exec(function(err, answ) {
+            if (err) throw err;
+
+            console.log('Errors: ', answ[0]);
+            self.client.quit();
+            callback && callback({
+                res: 'ok'
+            });
+        });
+    }, function(err) {
+        debug('Caught an error: ' + err.message, 1);
+        self.client.quit();
+        callback && callback({
+            res: 'err',
+            descr: err.message
+        });
+    });
+};
+
+Worker.prototype.start = function(callback) {
+    var self = this;
+
+    Step(function() {
+        self.enableClient(this.parallel());
+    }, function(err, res) {
+        if (err) throw err;
+
+        self.subscribe();
+        self.becomePublisher(this.parallel());
+        self.printStats();
+    }, function(err, res) {
+        if (err) throw err;
+
+        var group = this.group();
+
+        self.remainPublisher(group());
+        self.startPublish(group());
+    }, function(err, answers) {
+        if (err) throw err;
+
+        self.client.quit();
+        return;
+    }, function(err) {
+        self.client.quit();
+
+        callback && callback({
+            res: 'err',
+            descr: err.message
+        });
     });
 };
 
 var inputs = minimist(process.argv);
 
 if (inputs.debug) {
-	mainLogLevel = +inputs.debug;
+    mainLogLevel = +inputs.debug;
 }
 
 if (inputs.getErrors) {
-	debug('Before print errorrs', 0);
-	var curWorker = new Worker();
-	curWorker.printErrors();
-}
-else if (inputs.test) {
-	debug('Start benchmark', 0);
-	for (var i = 0; i < 5; ++i) {
-		var curWorker = new Worker({
-			id: i,
-			publishInterval : 0,
-			limit : 1000000
-		});
-    	curWorker.start();
-	}
-}
-else {
-	debug('Starting single worker', 0);
-	var curWorker = new Worker({
-		id : 0
-	});
+    debug('Before print errorrs', 0);
+    var curWorker = new Worker({
+        id: 0
+    });
+    curWorker.printErrors();
+} else if (inputs.test) {
+    debug('Start benchmark', 0);
+    for (var i = 0; i < 5; ++i) {
+        var curWorker = new Worker({
+            id: i,
+            publishInterval: 0,
+            limitMessages: 1000000
+        });
+        curWorker.start();
+    }
+} else {
+    debug('Starting single worker', 0);
+    var curWorker = new Worker({
+        id: 0
+    });
     curWorker.start();
 }

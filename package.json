@@ -11,6 +11,7 @@
   "dependencies": {
     "minimist": "^1.2.0",
     "redis": "^2.6.2",
+    "step": "0.0.6",
     "underscore": "^1.8.3"
   }
 }
