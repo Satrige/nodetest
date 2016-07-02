@@ -81,7 +81,7 @@ Writer.prototype.subscribe = function() {
 			callback(error, msg);
 		}
 
-		setTimeout(onComplete, 10); //Math.floor(Math.random() * 1000));
+		setTimeout(onComplete, Math.floor(Math.random() * 1000));
 	};
 
 	var errorHandler = function(err, msg) {
