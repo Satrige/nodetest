@@ -14,7 +14,7 @@ Command to start single worker:
     node index.js  --debug 3
     
 Command to start several workers:
-    node index.js *--numWorkers 5*
+    node index.js **--numWorkers 5**
     
 Command to start a test:
-    node index.js  *--test* --numWorkers 5 --debug 1
+    node index.js  **--test** --numWorkers 5 --debug 1
