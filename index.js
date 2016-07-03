@@ -240,6 +240,7 @@ Worker.prototype.start = function(callback) {
     }, function(err, answers) {
         if (err) throw err;
 
+        debug('Graceful shutdown', 3);
         self.client.quit();
         return;
     }, function(err) {
@@ -258,6 +259,8 @@ if (inputs.debug) {
     mainLogLevel = +inputs.debug;
 }
 
+var numWorkers = inputs.numWorkers || 1;
+
 if (inputs.getErrors) {
     debug('Before print errorrs', 0);
     var curWorker = new Worker({
@@ -266,7 +269,7 @@ if (inputs.getErrors) {
     curWorker.printErrors();
 } else if (inputs.test) {
     debug('Start benchmark', 0);
-    for (var i = 0; i < 5; ++i) {
+    for (var i = 0; i < numWorkers; ++i) {
         var curWorker = new Worker({
             id: i,
             publishInterval: 0,
@@ -275,9 +278,11 @@ if (inputs.getErrors) {
         curWorker.start();
     }
 } else {
-    debug('Starting single worker', 0);
-    var curWorker = new Worker({
-        id: 0
-    });
-    curWorker.start();
+    debug('Starting ' + numWorkers + ' workers', 0);
+    for (var i = 0; i < numWorkers; ++i) {
+        var curWorker = new Worker({
+	        id: i
+	    });
+	    curWorker.start();
+    }
 }
