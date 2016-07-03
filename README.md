@@ -8,7 +8,7 @@ Available options:
 
 
 Command to show and clear error log:
-    node index.js --getErrors
+    node index.js **--getErrors**
     
 Command to start single worker:
     node index.js  --debug 3
